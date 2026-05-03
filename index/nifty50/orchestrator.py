@@ -265,7 +265,7 @@ def orchestrator(instruments, strategy, mock):
 
         # Initialize Upstox client
         apiAccessToken = os.getenv(constants.UPSTOX_API_ACCESS_TOKEN)
-        apiAccessToken = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI3QkFYVDYiLCJqdGkiOiI2OTI5MjAxMWJhYWE3ODQyOWRmMzExMTkiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY0MzAyODY1LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjQzNjcyMDB9.H8WBSXuGzqsl3_nbHaJb9_IsxhIYDHlz0l5JA-H1gRM"
+        
         if apiAccessToken is None:
             logger.error("Upstox credentials not set in envoirnment.")
             sys.exit(constants.FAIL_CODE)
