@@ -7,7 +7,7 @@ import math
 from zoneinfo import ZoneInfo
 import common.constants as constants
 import logger
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime,time,timedelta
 import numpy as np
 import talib
@@ -177,7 +177,8 @@ class VwmaEmaStStrategy:
             "status": None,
             "ltp": None,
             "lot": None,
-            "max_gamma": None
+            "max_gamma": None,
+            "supertrend_flip_sl_modified_key": None,
         }
         self._trade_end_time=None
         self._init_trade_window_times()
@@ -596,6 +597,11 @@ class VwmaEmaStStrategy:
             except Exception as e:
                 logger.warning(f"Skipping malformed feed for {item.get('instrument_key')}: {e}")
                 continue
+
+        try:
+            self._modify_sl_open_trade_on_supertrend_flip(feed_response)
+        except Exception as e:
+            logger.warning(f"_modify_sl_open_trade_on_supertrend_flip error: {e}")
 
     # ------------------------------------------------------------------
     # Candle building
@@ -1101,6 +1107,21 @@ class VwmaEmaStStrategy:
             is_valid_setup
         )
 
+    def _should_modify_sl_on_supertrend_flip(self, latest: Optional[pd.Series]) -> Tuple[bool, str]:
+        if self._order_container.get("status") != constants.OPEN:
+            return False, ""
+        if latest is None:
+            return False, ""
+
+        side = self._order_container.get("side")
+        st_turn_red = bool(latest.get("st_turn_red", False))
+        st_turn_green = bool(latest.get("st_turn_green", False))
+        if side == constants.CALL and st_turn_red:
+            return True, "Supertrend turned red"
+        if side == constants.PUT and st_turn_green:
+            return True, "Supertrend turned green"
+        return False, ""
+
 
     def _trading_engine_active(self):
         """
@@ -1464,6 +1485,91 @@ class VwmaEmaStStrategy:
             return math.ceil(n) * tick
         return round(n) * tick
 
+    def _calculate_option_buy_sl_prices(
+        self,
+        option_ltp: float,
+        sp: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[float, float]:
+        params_root = self.params if isinstance(self.params, dict) else {}
+        sp = sp or (params_root.get("strategy-parameters") or {})
+        tick = float(
+            sp.get(
+                "tick-size",
+                sp.get("tick_size", params_root.get("tick-size", params_root.get("tick_size", 0.05))),
+            )
+        )
+        sl_limit_gap = float(sp.get("sl-limit-gap", sp.get("sl_limit_gap", 1.0)))
+        sl_offset = float(sp.get("supertrend_flip_sl_points", sp.get("supertrend_flip_sl_offset", 4.0)))
+
+        sl_trigger = self._round_to_tick(float(option_ltp) - sl_offset, tick, "CEIL")
+        sl_limit = self._round_to_tick(sl_trigger - sl_limit_gap, tick, "FLOOR")
+        if sl_limit >= sl_trigger:
+            sl_limit = self._round_to_tick(sl_trigger - tick, tick, "FLOOR")
+        return sl_trigger, sl_limit
+
+    def _modify_sl_open_trade_on_supertrend_flip(self, feed_response: Optional[list]) -> bool:
+        if self._order_container.get("status") != constants.OPEN:
+            return False
+
+        latest = self.df_index.iloc[-1] if self.df_index is not None and not self.df_index.empty else None
+        should_modify_sl, modify_reason = self._should_modify_sl_on_supertrend_flip(latest)
+        if not should_modify_sl:
+            return False
+
+        trade_id = self._order_container.get("trade_id")
+        instrument_key = self._order_container.get("instrument_key")
+        if not trade_id or not instrument_key:
+            return False
+        if self.order_maneger is None or not hasattr(self.order_maneger, "modify_sl_order"):
+            logger.warning(
+                f"Unable to modify SL on Supertrend flip; trade_id={trade_id}, order manager unavailable"
+            )
+            return False
+
+        latest_time = str(latest.get("time", "")) if latest is not None else ""
+        flip_key = f"{trade_id}:{latest_time}:{modify_reason}"
+        if self._order_container.get("supertrend_flip_sl_modified_key") == flip_key:
+            return False
+
+        latest_ltp = safe_float(self._order_container.get("ltp"))
+        modify_ts = self._resolve_reference_ts()
+        for item in feed_response or []:
+            if item.get("instrument_key") != instrument_key:
+                continue
+            item_ltp = safe_float(item.get("ltp"))
+            if item_ltp is not None:
+                latest_ltp = item_ltp
+            ts_ms = safe_float(item.get("ts_epoch_ms") or item.get("ltt"))
+            if ts_ms is not None:
+                modify_ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=ist)
+            break
+
+        if latest_ltp is None:
+            logger.warning(f"Unable to modify SL on Supertrend flip; trade_id={trade_id}, ltp unavailable")
+            return False
+
+        sp = (self.params.get("strategy-parameters") or {}) if isinstance(self.params, dict) else {}
+        sl_trigger, sl_limit = self._calculate_option_buy_sl_prices(float(latest_ltp), sp)
+
+        self._order_container["ltp"] = float(latest_ltp)
+        logger.info(
+            f"{modify_reason}; modify SL trade_id={trade_id}, "
+            f"symbol={self._order_container.get('instrument_symbol')}, latest_ltp={latest_ltp:.2f}, "
+            f"sl_trigger={sl_trigger:.2f}, sl_limit={sl_limit:.2f}"
+        )
+        sl_modified = self.order_maneger.modify_sl_order(
+            trade_id=trade_id,
+            ltp_now=float(latest_ltp),
+            new_trigger=float(sl_trigger),
+            new_limit=float(sl_limit),
+            ts=modify_ts,
+        )
+        if not sl_modified:
+            return False
+
+        self._order_container["supertrend_flip_sl_modified_key"] = flip_key
+        return True
+
     # ------------------------------------------------------------------
     # Order processing (WAITING -> OPEN -> EOD)
     # ------------------------------------------------------------------
@@ -1735,6 +1841,7 @@ class VwmaEmaStStrategy:
 
         # 2) OPEN -> feed LTP to OMS for fixed SL/TP monitoring
         if self._order_container.get("status") == constants.OPEN:
+            self._modify_sl_open_trade_on_supertrend_flip(feed_response)
             latest_ltp = None
             ts = None
             for item in feed_response:
