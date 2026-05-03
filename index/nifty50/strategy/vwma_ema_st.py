@@ -1708,6 +1708,7 @@ class VwmaEmaStStrategy:
         sp = (self.params.get("strategy-parameters") or {}) if isinstance(self.params, dict) else {}
         if not feed_response:
             return
+        sl_modified_on_supertrend_flip = False
 
         # 1) WAITING -> pick contract + place order
         if (
@@ -1841,7 +1842,7 @@ class VwmaEmaStStrategy:
 
         # 2) OPEN -> feed LTP to OMS for fixed SL/TP monitoring
         if self._order_container.get("status") == constants.OPEN:
-            self._modify_sl_open_trade_on_supertrend_flip(feed_response)
+            sl_modified_on_supertrend_flip = self._modify_sl_open_trade_on_supertrend_flip(feed_response)
             latest_ltp = None
             ts = None
             for item in feed_response:
@@ -1898,6 +1899,13 @@ class VwmaEmaStStrategy:
                 return
 
             if current_time >= self._trade_end_time:
+                if sl_modified_on_supertrend_flip or self._modify_sl_open_trade_on_supertrend_flip(feed_response):
+                    logger.info(
+                        f"Trade window end reached at {self.curr_index_minute}; "
+                        "Supertrend flip SL modified, keeping open trade active."
+                    )
+                    return
+
                 trade_id = self._order_container.get("trade_id")
                 latest_ltp = None
                 for item in feed_response:
