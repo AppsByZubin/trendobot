@@ -141,6 +141,7 @@ class VwmaEmaStStrategy:
             "st_lowerbound": pd.Series(dtype="float64"),
             "supertrend": pd.Series(dtype="float64"),
             "st_direction": pd.Series(dtype="float64"),
+            "st_phase": pd.Series(dtype="object"),
             "st_turn_green": pd.Series(dtype="bool"),
             "st_turn_red": pd.Series(dtype="bool"),
 
@@ -165,6 +166,9 @@ class VwmaEmaStStrategy:
         self._today_realized_pnl_day: Optional[str] = None
         self._today_realized_pnl: float = 0.0
         self._today_realized_pnl_trade_ids = set()
+        self._st_phase_skip_day: Optional[str] = None
+        self._st_phase_at_trade_start: Optional[str] = None
+        self._st_phase_waiting_for_next: bool = True
         self.order_maneger = order_manager
 
         # In-memory trade state machine used by _trade_processing():
@@ -1063,6 +1067,11 @@ class VwmaEmaStStrategy:
 
             st_direction = self.df_index["st_direction"]
             prev_st_direction = st_direction.shift(1)
+            self.df_index["st_phase"] = np.select(
+                [st_direction < 0, st_direction > 0],
+                ["green", "red"],
+                default=None,
+            )
             self.df_index["st_turn_green"] = (st_direction < 0) & (prev_st_direction > 0)
             self.df_index["st_turn_red"] = (st_direction > 0) & (prev_st_direction < 0)
 
@@ -1140,14 +1149,18 @@ class VwmaEmaStStrategy:
             if self._order_container["status"] is not None:
                 return
 
-            atr_14 = safe_float(self.df_index.iloc[-1].get('atr_14'))
+            ref_ts = self._resolve_reference_ts()
+            latest = self.df_index.iloc[-1]
+            if self._should_skip_st_phase_passing_trade_start(latest, ref_ts):
+                return
+
+            atr_14 = safe_float(latest.get('atr_14'))
             if atr_14 is None:
                 return
             if atr_14 < 7:
                 logger.debug(f"ATR range is low {atr_14}")
                 return
 
-            ref_ts = self._resolve_reference_ts()
             if self._is_post_exit_cooldown_active(ref_ts):
                 cooldown_left_sec = int(max((self._post_exit_cooldown_until - ref_ts).total_seconds(), 0))
                 logger.debug(
@@ -1159,26 +1172,27 @@ class VwmaEmaStStrategy:
             if self._is_daily_loss_limit_active(ref_ts):
                 return
 
-            rsi_ma_14_val = self.df_index.iloc[-1].get('rsi_ma_14', np.nan)
+            rsi_ma_14_val = latest.get('rsi_ma_14', np.nan)
             previous_rsi_ma_14_val = self.df_index.iloc[-2].get('rsi_ma_14', np.nan)
             if pd.isna(rsi_ma_14_val) or pd.isna(previous_rsi_ma_14_val):
                 return
             rsi_ma_14 = math.ceil(float(rsi_ma_14_val))
             previous_rsi_ma_14 = math.ceil(float(previous_rsi_ma_14_val))
-            ema_9 = float(self.df_index.iloc[-1].get('ema_9', np.nan))
-            vma_25 = float(self.df_index.iloc[-1].get('vwma_25', np.nan))
-            angle_ema_9 = float(self.df_index.iloc[-1].get('angle_ema_9', np.nan))
-            angle_vwma_25 = float(self.df_index.iloc[-1].get('angle_vwma_25', np.nan))
-            angle_rsi_ma_14 = float(self.df_index.iloc[-1].get('angle_rsi_ma_14', np.nan))
-            is_bearish_thrust = bool(self.df_index.iloc[-1].get('is_bearish_thrust', False))
-            is_bullish_thrust = bool(self.df_index.iloc[-1].get('is_bullish_thrust', False))
-            future_volume = safe_float(self.df_index.iloc[-1].get('fut_volume', np.nan))
-            supertrend = safe_float(self.df_index.iloc[-1].get('supertrend', np.nan))
-            st_direction = safe_float(self.df_index.iloc[-1].get('st_direction', np.nan))
+            ema_9 = float(latest.get('ema_9', np.nan))
+            vma_25 = float(latest.get('vwma_25', np.nan))
+            angle_ema_9 = float(latest.get('angle_ema_9', np.nan))
+            angle_vwma_25 = float(latest.get('angle_vwma_25', np.nan))
+            angle_rsi_ma_14 = float(latest.get('angle_rsi_ma_14', np.nan))
+            is_bearish_thrust = bool(latest.get('is_bearish_thrust', False))
+            is_bullish_thrust = bool(latest.get('is_bullish_thrust', False))
+            future_volume = safe_float(latest.get('fut_volume', np.nan))
+            supertrend = safe_float(latest.get('supertrend', np.nan))
+            st_direction = safe_float(latest.get('st_direction', np.nan))
             if supertrend is None or st_direction is None:
                 return
-            st_turn_green = bool(self.df_index.iloc[-1].get('st_turn_green', False))
-            st_turn_red = bool(self.df_index.iloc[-1].get('st_turn_red', False))
+            st_phase = self._resolve_st_phase(latest)
+            st_turn_green = bool(latest.get('st_turn_green', False))
+            st_turn_red = bool(latest.get('st_turn_red', False))
 
             up_angle_ema = float(sp.get("up_angle_ema", self.params.get("up_angle_ema", 50)))
             up_angle_vwma = float(sp.get("up_angle_vwma", self.params.get("up_angle_vwma", 20)))
@@ -1195,6 +1209,7 @@ class VwmaEmaStStrategy:
                 f"angle_ema={angle_ema_9}, angle_vwma={angle_vwma_25}, angle_rsi_ma={angle_rsi_ma_14}, "
                 f"future_volume={future_volume}, "
                 f"supertrend={supertrend}, st_direction={st_direction}, "
+                f"st_phase={st_phase}, "
                 f"st_turn_green={st_turn_green}, st_turn_red={st_turn_red}, "
                 f"orb_side={orb_side}, bullish_thrust={is_bullish_thrust}, bearish_thrust={is_bearish_thrust}, "
                 f"current_candle_range={safe_float(self.df_index.iloc[-1].get('candle_range', np.nan))}"
@@ -1205,7 +1220,7 @@ class VwmaEmaStStrategy:
                 and (ema_9 > vma_25)
                 and (angle_ema_9 > up_angle_ema)
                 and (angle_vwma_25 > up_angle_vwma)
-                and st_turn_green
+                and (st_phase == "green")
                 and (st_direction < 0)
                 and ((not orb_enabled) or (orb_side == constants.CALL))
             )
@@ -1215,7 +1230,7 @@ class VwmaEmaStStrategy:
                 and (ema_9 < vma_25)
                 and (angle_ema_9 < dn_angle_ema)
                 and (angle_vwma_25 < dn_angle_vwma)
-                and st_turn_red
+                and (st_phase == "red")
                 and (st_direction > 0)
                 and ((not orb_enabled) or (orb_side == constants.PUT))
             )
@@ -1256,7 +1271,14 @@ class VwmaEmaStStrategy:
         trade_window = sp.get("trade-window") or sp.get("trade_window") or self.params.get("trade-window") or self.params.get("trade_window") or {}
         if not isinstance(trade_window, dict):
             trade_window = {}
+        market_hours = self.params.get("market-hours", {}) if isinstance(self.params, dict) else {}
+        start_str = str(trade_window.get("start", market_hours.get("start", "09:45"))).strip()
         end_str = str(trade_window.get("end") or "15:10").strip()
+        try:
+            hh, mm = map(int, start_str.split(":"))
+            self._trade_start_time = time(hh, mm)
+        except Exception:
+            self._trade_start_time = time(9, 45)
         try:
             hh, mm = map(int, end_str.split(":"))
             self._trade_end_time = time(hh, mm)
@@ -1289,6 +1311,135 @@ class VwmaEmaStStrategy:
             except Exception:
                 pass
         return datetime.now(ist)
+
+    def _trade_start_time_obj(self) -> time:
+        return getattr(self, "_trade_start_time", time(9, 45))
+
+    def _resolve_st_phase(self, latest: pd.Series) -> Optional[str]:
+        phase_raw = latest.get("st_phase")
+        phase = str(phase_raw).strip().lower() if phase_raw is not None and not pd.isna(phase_raw) else ""
+        if phase in {"green", "red"}:
+            return phase
+
+        st_direction = safe_float(latest.get("st_direction"))
+        if st_direction is None:
+            return None
+        if st_direction < 0:
+            return "green"
+        if st_direction > 0:
+            return "red"
+        return None
+
+    def _trade_start_phase_grace_minutes(self) -> int:
+        sp = (self.params.get("strategy-parameters") or {}) if isinstance(self.params, dict) else {}
+        try:
+            return max(0, int(sp.get("supertrend_trade_start_phase_grace_minutes", 1) or 0))
+        except Exception:
+            return 1
+
+    def _capture_st_phase_passing_trade_start(self) -> None:
+        if self.df_index is None or self.df_index.empty or "time" not in self.df_index.columns:
+            return
+
+        candle_times = pd.to_datetime(self.df_index["time"], errors="coerce")
+        if candle_times.empty:
+            return
+
+        latest_ts = candle_times.iloc[-1]
+        if pd.isna(latest_ts):
+            return
+
+        trade_start = self._trade_start_time_obj()
+        if latest_ts.time() < trade_start:
+            return
+
+        day_key = latest_ts.strftime("%Y-%m-%d")
+        if self._st_phase_skip_day == day_key:
+            return
+
+        same_day = candle_times.dt.strftime("%Y-%m-%d") == day_key
+        at_or_before_start = same_day & (candle_times.dt.time <= trade_start)
+        anchor_idx = candle_times[at_or_before_start].idxmax() if at_or_before_start.any() else None
+        anchor_phase = self._resolve_st_phase(self.df_index.loc[anchor_idx]) if anchor_idx is not None else None
+
+        if anchor_phase is None:
+            at_or_after_start = same_day & (candle_times.dt.time >= trade_start)
+            for idx in candle_times[at_or_after_start].sort_values().index:
+                anchor_phase = self._resolve_st_phase(self.df_index.loc[idx])
+                if anchor_phase is not None:
+                    anchor_idx = idx
+                    break
+
+        if anchor_idx is None or anchor_phase is None:
+            return
+
+        anchor_ts = candle_times.loc[anchor_idx]
+        self._st_phase_skip_day = day_key
+        self._st_phase_at_trade_start = anchor_phase
+        self._st_phase_waiting_for_next = True
+        logger.info(
+            f"Skipping Supertrend phase passing through trade start: "
+            f"day={day_key}, trade_start={trade_start.strftime('%H:%M')}, "
+            f"anchor_time={anchor_ts.strftime('%H:%M')}, st_phase={anchor_phase}"
+        )
+
+    def _should_absorb_trade_start_boundary_flip(self, latest: pd.Series, phase: str) -> bool:
+        if phase == self._st_phase_at_trade_start:
+            return False
+
+        grace_minutes = self._trade_start_phase_grace_minutes()
+        if grace_minutes <= 0:
+            return False
+
+        latest_ts = pd.to_datetime(latest.get("time"), errors="coerce")
+        if pd.isna(latest_ts):
+            return False
+        if getattr(latest_ts, "tzinfo", None) is not None:
+            latest_ts = latest_ts.tz_convert(ist).tz_localize(None)
+
+        latest_dt = latest_ts.to_pydatetime()
+        trade_start_dt = datetime.combine(latest_dt.date(), self._trade_start_time_obj())
+        if latest_dt < trade_start_dt or latest_dt > trade_start_dt + timedelta(minutes=grace_minutes):
+            return False
+
+        return bool(latest.get("st_turn_green", False) or latest.get("st_turn_red", False))
+
+    def _should_skip_st_phase_passing_trade_start(self, latest: pd.Series, ref_ts: datetime) -> bool:
+        self._capture_st_phase_passing_trade_start()
+
+        phase = self._resolve_st_phase(latest)
+        if phase is None:
+            return True
+
+        day_key = ref_ts.strftime("%Y-%m-%d")
+        if self._st_phase_skip_day != day_key:
+            logger.debug("Entry blocked until Supertrend phase passing through trade start is captured")
+            return True
+
+        if self._st_phase_waiting_for_next:
+            if phase == self._st_phase_at_trade_start:
+                logger.debug(
+                    f"Entry blocked until Supertrend flips from phase passing through trade start; "
+                    f"trade_start_st_phase={self._st_phase_at_trade_start}, current_st_phase={phase}"
+                )
+                return True
+
+            if self._should_absorb_trade_start_boundary_flip(latest, phase):
+                previous_phase = self._st_phase_at_trade_start
+                self._st_phase_at_trade_start = phase
+                logger.info(
+                    f"Absorbing Supertrend flip at trade-start boundary; "
+                    f"previous_captured_phase={previous_phase}, updated_skip_phase={phase}"
+                )
+                return True
+
+            self._st_phase_waiting_for_next = False
+            logger.info(
+                f"Trade-start Supertrend phase skipped; accepting next phase "
+                f"trade_start_st_phase={self._st_phase_at_trade_start}, current_st_phase={phase}"
+            )
+
+        return False
 
     def _set_post_exit_cooldown(self, exit_status: Optional[str], ts: Optional[datetime] = None) -> None:
         status = str(exit_status or "").strip().upper()
