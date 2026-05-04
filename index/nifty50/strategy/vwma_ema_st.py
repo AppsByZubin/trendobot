@@ -233,6 +233,22 @@ class VwmaEmaStStrategy:
                 return False
         return default
 
+    @staticmethod
+    def _indicator_flag_is_true(value: Any) -> bool:
+        if value is None:
+            return False
+
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, (bool, np.bool_)) and missing:
+                return False
+        except (TypeError, ValueError):
+            pass
+
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
     def _update_gap_stats(self, candle: Dict[str, Any]) -> None:
         minute_key = str(candle.get("time") or "")
         try:
@@ -1123,8 +1139,8 @@ class VwmaEmaStStrategy:
             return False, ""
 
         side = self._order_container.get("side")
-        st_turn_red = bool(latest.get("st_turn_red", False))
-        st_turn_green = bool(latest.get("st_turn_green", False))
+        st_turn_red = self._indicator_flag_is_true(latest.get("st_turn_red", False))
+        st_turn_green = self._indicator_flag_is_true(latest.get("st_turn_green", False))
         if side == constants.CALL and st_turn_red:
             return True, "Supertrend turned red"
         if side == constants.PUT and st_turn_green:
@@ -1183,16 +1199,16 @@ class VwmaEmaStStrategy:
             angle_ema_9 = float(latest.get('angle_ema_9', np.nan))
             angle_vwma_25 = float(latest.get('angle_vwma_25', np.nan))
             angle_rsi_ma_14 = float(latest.get('angle_rsi_ma_14', np.nan))
-            is_bearish_thrust = bool(latest.get('is_bearish_thrust', False))
-            is_bullish_thrust = bool(latest.get('is_bullish_thrust', False))
+            is_bearish_thrust = self._indicator_flag_is_true(latest.get('is_bearish_thrust', False))
+            is_bullish_thrust = self._indicator_flag_is_true(latest.get('is_bullish_thrust', False))
             future_volume = safe_float(latest.get('fut_volume', np.nan))
             supertrend = safe_float(latest.get('supertrend', np.nan))
             st_direction = safe_float(latest.get('st_direction', np.nan))
             if supertrend is None or st_direction is None:
                 return
             st_phase = self._resolve_st_phase(latest)
-            st_turn_green = bool(latest.get('st_turn_green', False))
-            st_turn_red = bool(latest.get('st_turn_red', False))
+            st_turn_green = self._indicator_flag_is_true(latest.get('st_turn_green', False))
+            st_turn_red = self._indicator_flag_is_true(latest.get('st_turn_red', False))
 
             up_angle_ema = float(sp.get("up_angle_ema", self.params.get("up_angle_ema", 50)))
             up_angle_vwma = float(sp.get("up_angle_vwma", self.params.get("up_angle_vwma", 20)))
@@ -1402,7 +1418,10 @@ class VwmaEmaStStrategy:
         if latest_dt < trade_start_dt or latest_dt > trade_start_dt + timedelta(minutes=grace_minutes):
             return False
 
-        return bool(latest.get("st_turn_green", False) or latest.get("st_turn_red", False))
+        return (
+            self._indicator_flag_is_true(latest.get("st_turn_green", False))
+            or self._indicator_flag_is_true(latest.get("st_turn_red", False))
+        )
 
     def _should_skip_st_phase_passing_trade_start(self, latest: pd.Series, ref_ts: datetime) -> bool:
         self._capture_st_phase_passing_trade_start()

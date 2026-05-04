@@ -378,7 +378,7 @@ def nifty50_engine(strategy, mode, param_data):
                 intraday_future_candles=intraday_day_future_candles,
             )
         else:
-            logger.error(f"Strategy {strategy} is not available in haemabot.")
+            logger.error(f"Strategy {strategy} is not available in trendobot.")
             sys.exit(constants.FAIL_CODE)
 
         # start PCR poller once (DO NOT stop on transient WS close)

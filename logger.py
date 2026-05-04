@@ -62,7 +62,7 @@ def create_logger(name):
 
     # File handler without color
     os.makedirs("logs", exist_ok=True)
-    log_filename = f"logs/{datetime.now().strftime('%d-%m-%y_haemabot.log')}"
+    log_filename = f"logs/{datetime.now().strftime('%d-%m-%y_trendobot.log')}"
     file_handler = logging.FileHandler(log_filename)
     file_handler.setLevel(logging.DEBUG)
     file_formatter = LogFormatter(fmt=format_str, color=False)
