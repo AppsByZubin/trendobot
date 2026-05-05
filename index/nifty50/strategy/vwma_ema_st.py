@@ -4,6 +4,7 @@ import os
 import yaml
 import pandas as pd
 import math
+from threading import RLock
 from zoneinfo import ZoneInfo
 import common.constants as constants
 import logger
@@ -67,6 +68,7 @@ class VwmaEmaStStrategy:
         self._fut_vol_start_vtt = None
         self._fut_vol_last_vtt = None
         self._fut_vol_by_minute: Dict[str, float] = {}
+        self._candle_lock = RLock()
 
         # DataFrames (initialized with fixed dtypes to avoid warnings)
         self.df_index_future = pd.DataFrame({
@@ -587,12 +589,13 @@ class VwmaEmaStStrategy:
             ltp = safe_float(item.get("ltp"))
             if ltp is None:
                 return
-            vtt = safe_float(item.get("vtt"))
-            if vtt is not None:
-                finished_minute, finished_vol = self._update_1m_volume_from_vtt(minute_key, vtt)
-                if finished_minute is not None:
-                    self._fut_vol_by_minute[finished_minute] = float(finished_vol)
-            self._handle_fut_tick(minute_key, float(ltp))
+            with self._candle_lock:
+                vtt = safe_float(item.get("vtt"))
+                if vtt is not None:
+                    finished_minute, finished_vol = self._update_1m_volume_from_vtt(minute_key, vtt)
+                    if finished_minute is not None:
+                        self._fut_vol_by_minute[finished_minute] = float(finished_vol)
+                self._handle_fut_tick(minute_key, float(ltp))
             return
 
         ltp = safe_float(item.get("ltp"))
@@ -697,99 +700,109 @@ class VwmaEmaStStrategy:
             self.df_index_future = pd.concat([self.df_index_future, pd.DataFrame([row])], ignore_index=True)
 
     def _finalize_fut_candle(self) -> None:
-        if self.curr_fut_candle is None:
-            return
-        minute = str(self.curr_fut_candle.get("time") or "")
-        if minute in self._fut_vol_by_minute:
-            self.curr_fut_candle["volume"] = float(self._fut_vol_by_minute.pop(minute, 0.0))
-        logger.info(f"Finalizing future candle: {self.curr_fut_candle}")
-        self._upsert_future_candle(self.curr_fut_candle)
-        self.last_fut_bar = dict(self.curr_fut_candle)
-        self.curr_fut_candle = None
-        self._try_make_merged_bar()
+        with self._candle_lock:
+            candle = self.curr_fut_candle
+            if candle is None:
+                return
+
+            candle = dict(candle)
+            self.curr_fut_candle = None
+            minute = str(candle.get("time") or "")
+            if minute in self._fut_vol_by_minute:
+                candle["volume"] = float(self._fut_vol_by_minute.pop(minute, 0.0))
+            logger.info(f"Finalizing future candle: {candle}")
+            self._upsert_future_candle(candle)
+            self.last_fut_bar = candle
+            self._try_make_merged_bar()
 
     def _handle_fut_tick(self, minute_key: str, ltp: float) -> None:
         """Build 1-minute OHLC for FUT using ltp."""
         try:
-            if minute_key is None:
-                return
-            minute_key = str(minute_key)
+            with self._candle_lock:
+                if minute_key is None:
+                    return
+                minute_key = str(minute_key)
 
-            ltp_f = safe_float(ltp)
-            if ltp_f is None or ltp_f <= 0:
-                return
+                ltp_f = safe_float(ltp)
+                if ltp_f is None or ltp_f <= 0:
+                    return
 
-            if self.curr_fut_minute != minute_key:
-                if self.curr_fut_candle is not None:
-                    try:
-                        self._finalize_fut_candle()
-                    except Exception as e:
-                        logger.error(f"Error in _finalize_fut_candle: {e}")
+                if self.curr_fut_minute != minute_key:
+                    if self.curr_fut_candle is not None:
+                        try:
+                            self._finalize_fut_candle()
+                        except Exception as e:
+                            logger.error(f"Error in _finalize_fut_candle: {e}")
 
-                self.curr_fut_minute = minute_key
-                self.curr_fut_candle = {
-                    "time": minute_key,
-                    "open": ltp_f,
-                    "high": ltp_f,
-                    "low": ltp_f,
-                    "close": ltp_f,
-                    "volume": 0.0,
-                    "oi": float("nan"),
-                }
-                return
+                    self.curr_fut_minute = minute_key
+                    self.curr_fut_candle = {
+                        "time": minute_key,
+                        "open": ltp_f,
+                        "high": ltp_f,
+                        "low": ltp_f,
+                        "close": ltp_f,
+                        "volume": 0.0,
+                        "oi": float("nan"),
+                    }
+                    return
 
-            c = self.curr_fut_candle
-            if c is None:
-                return
+                c = self.curr_fut_candle
+                if c is None:
+                    return
 
-            c["high"] = max(float(c.get("high", ltp_f)), ltp_f)
-            c["low"] = min(float(c.get("low", ltp_f)), ltp_f)
-            c["close"] = ltp_f
+                c["high"] = max(float(c.get("high", ltp_f)), ltp_f)
+                c["low"] = min(float(c.get("low", ltp_f)), ltp_f)
+                c["close"] = ltp_f
         except Exception as e:
             logger.error(f"Error in _handle_fut_tick: {e}")
 
     def _handle_index_tick(self, minute_key: str, ltp: float):
         """Aggregate spot ticks into 1-minute OHLC candles."""
-        
-        # New minute?
-        if self.curr_index_minute is None or minute_key != self.curr_index_minute:
-            # finalize previous candle if exists
-            if self.curr_index_candle is not None:
-                self._finalize_index_candle()
+        with self._candle_lock:
+            # New minute?
+            if self.curr_index_minute is None or minute_key != self.curr_index_minute:
+                # finalize previous candle if exists
+                if self.curr_index_candle is not None:
+                    self._finalize_index_candle()
 
-            # start new candle
-            self.curr_index_minute = minute_key
-            self.curr_index_candle = {
-                "time": minute_key,
-                "open": ltp,
-                "high": ltp,
-                "low": ltp,
-                "close": ltp,
-            }
-            # Compute day gap from first observed tick/candle open for the day.
-            day_key = self._extract_day_key(minute_key)
-            if day_key and self._gap_day != day_key:
-                self._update_gap_stats(self.curr_index_candle)
-        else:
-            c = self.curr_index_candle
-            c["high"] = max(c["high"], ltp)
-            c["low"] = min(c["low"], ltp)
-            c["close"] = ltp
+                # start new candle
+                self.curr_index_minute = minute_key
+                self.curr_index_candle = {
+                    "time": minute_key,
+                    "open": ltp,
+                    "high": ltp,
+                    "low": ltp,
+                    "close": ltp,
+                }
+                # Compute day gap from first observed tick/candle open for the day.
+                day_key = self._extract_day_key(minute_key)
+                if day_key and self._gap_day != day_key:
+                    self._update_gap_stats(self.curr_index_candle)
+            else:
+                c = self.curr_index_candle
+                if c is None:
+                    return
+                c["high"] = max(c["high"], ltp)
+                c["low"] = min(c["low"], ltp)
+                c["close"] = ltp
     
 
     def _finalize_index_candle(self):
         """Persist completed candle and run dependent analytics."""
-        c = self.curr_index_candle
-        if c is None:
-            return
-        logger.info(f"Current minute:{self.curr_index_minute}, Finalizing index candle: {c}")
-        self.df_index = pd.concat([self.df_index, pd.DataFrame([c])], ignore_index=True)
-        self.last_index_bar = c
-        self.curr_index_candle = None
-        self._try_make_merged_bar()
+        with self._candle_lock:
+            c = self.curr_index_candle
+            if c is None:
+                return
 
-        if self.index_fur_key is None:
-            self._apply_indicators_and_engine()
+            c = dict(c)
+            self.curr_index_candle = None
+            logger.info(f"Current minute:{self.curr_index_minute}, Finalizing index candle: {c}")
+            self.df_index = pd.concat([self.df_index, pd.DataFrame([c])], ignore_index=True)
+            self.last_index_bar = c
+            self._try_make_merged_bar()
+
+            if self.index_fur_key is None:
+                self._apply_indicators_and_engine()
 
     def _try_make_merged_bar(self) -> None:
         if self.last_index_bar is None or self.last_fut_bar is None:
